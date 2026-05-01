@@ -3,7 +3,7 @@ name: HELIX Kaggle Leaderboard Monitor
 on:
   schedule:
     - cron: '*/15 * * * *'   # every 15 minutes
-  workflow_dispatch:           # manual trigger button
+  workflow_dispatch:         # manual trigger button
 
 # allow the workflow to push commits back
 permissions:
@@ -15,6 +15,7 @@ jobs:
     concurrency:
       group: kaggle-monitor
       cancel-in-progress: false
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,22 +30,15 @@ jobs:
       - name: Install deps
         run: pip install kaggle requests
 
-      - name: Configure Kaggle credentials
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
-        run: |
-          mkdir -p ~/.kaggle
-          printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-
       - name: Poll leaderboard + alert
         env:
-          COMP:           ${{ vars.COMP }}
-          MY_TEAM:        ${{ secrets.MY_TEAM }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          NOTIFY_TO:      ${{ secrets.NOTIFY_TO }}
-          NOTIFY_FROM:    ${{ vars.NOTIFY_FROM }}
+          COMP:            ${{ vars.COMP }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+          MY_TEAM:         ${{ secrets.MY_TEAM }}
+          RESEND_API_KEY:  ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_TO:       ${{ secrets.NOTIFY_TO }}
+          NOTIFY_FROM:     ${{ vars.NOTIFY_FROM }}
         run: python monitor.py
 
       - name: Commit snapshot
