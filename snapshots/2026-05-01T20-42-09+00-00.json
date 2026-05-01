@@ -1,0 +1,104 @@
+{
+  "at": "2026-05-01T20:42:09+00:00",
+  "team_count": 16,
+  "my_rank": null,
+  "my_score": null,
+  "top_25": [
+    {
+      "team_id": "15747379",
+      "team_name": "Nathan Herling",
+      "score": "0.93309",
+      "submitted": "2026-05-01 07:26:46"
+    },
+    {
+      "team_id": "15785901",
+      "team_name": "Abdul Wahed Nab",
+      "score": "0.93235",
+      "submitted": "2026-04-29 23:00:48"
+    },
+    {
+      "team_id": "15556348",
+      "team_name": "Jakob Garcia",
+      "score": "0.93090",
+      "submitted": "2026-04-11 05:52:46"
+    },
+    {
+      "team_id": "15773121",
+      "team_name": "Fedoua Rahmaouy",
+      "score": "0.92954",
+      "submitted": "2026-05-01 01:04:17"
+    },
+    {
+      "team_id": "15573985",
+      "team_name": "Anitha Karni",
+      "score": "0.92696",
+      "submitted": "2026-04-30 22:32:46"
+    },
+    {
+      "team_id": "15732038",
+      "team_name": "Hardik Chemburkar",
+      "score": "0.92675",
+      "submitted": "2026-04-30 18:43:09"
+    },
+    {
+      "team_id": "15761221",
+      "team_name": "Duncan Alexander Yuen",
+      "score": "0.92627",
+      "submitted": "2026-04-29 05:29:23"
+    },
+    {
+      "team_id": "15783775",
+      "team_name": "Yida Fang",
+      "score": "0.92612",
+      "submitted": "2026-05-01 15:32:32"
+    },
+    {
+      "team_id": "15740885",
+      "team_name": "Vivian My Huynh",
+      "score": "0.92250",
+      "submitted": "2026-04-30 21:30:44"
+    },
+    {
+      "team_id": "15662762",
+      "team_name": "Erli Tang",
+      "score": "0.92080",
+      "submitted": "2026-04-22 01:54:01"
+    },
+    {
+      "team_id": "15634266",
+      "team_name": "Davo Acevedo Cardona",
+      "score": "0.91599",
+      "submitted": "2026-04-25 00:13:53"
+    },
+    {
+      "team_id": "15746262",
+      "team_name": "Levi Windham Stoner",
+      "score": "0.91392",
+      "submitted": "2026-04-29 05:28:58"
+    },
+    {
+      "team_id": "15579957",
+      "team_name": "MOKSHAGNA GNANATEJA TALAPANENI",
+      "score": "0.91281",
+      "submitted": "2026-05-01 01:27:24"
+    },
+    {
+      "team_id": "15752171",
+      "team_name": "WKL_2",
+      "score": "0.90805",
+      "submitted": "2026-04-27 16:06:45"
+    },
+    {
+      "team_id": "15759945",
+      "team_name": "Wenkang Lyu",
+      "score": "0.90805",
+      "submitted": "2026-04-28 04:34:06"
+    },
+    {
+      "team_id": "15437243",
+      "team_name": "sample_submission.csv",
+      "score": "0.32597",
+      "submitted": "2026-03-19 01:55:04"
+    }
+  ]
+}
