@@ -2,10 +2,12 @@
 """
 HELIX :: Kaggle leaderboard polling worker for GitHub Actions.
 
-  - Pulls the leaderboard via the official kaggle CLI.
-  - Diffs current board vs last committed state.json.
-  - On ANY change (score, new team, removed team, resubmission) -> emails via Resend.
-  - Writes a fresh state.json + per-poll snapshot for the git commit.
+  Email policy:
+    cold-start (first run, no prev state)   -> EMAIL
+    changes detected                         -> EMAIL
+    no change AND FORCE_EMAIL=true           -> EMAIL (manual test)
+    no change AND >= 4h since last email     -> EMAIL (heartbeat)
+    no change AND < 4h since last email      -> SILENT (action log only)
 
 Required env (set as repo Secrets / Variables in GitHub):
   COMP             (variable)  competition slug, e.g. ling-539-competition-2026
@@ -15,6 +17,7 @@ Required env (set as repo Secrets / Variables in GitHub):
   RESEND_API_KEY   (secret)    re_xxx... from resend.com (free tier 100/day)
   NOTIFY_TO        (secret)    where to send the alert
   NOTIFY_FROM      (variable)  default 'HELIX <onboarding@resend.dev>'
+  FORCE_EMAIL      (input)     'true' to force an email regardless of state
 """
 
 from __future__ import annotations
@@ -43,6 +46,9 @@ MY_TEAM     = os.environ.get("MY_TEAM", "").strip().lower()
 RESEND_KEY  = os.environ.get("RESEND_API_KEY", "").strip()
 NOTIFY_TO   = os.environ.get("NOTIFY_TO", "").strip()
 NOTIFY_FROM = os.environ.get("NOTIFY_FROM", "HELIX <onboarding@resend.dev>").strip()
+FORCE_EMAIL = os.environ.get("FORCE_EMAIL", "").strip().lower() in ("true", "1", "yes")
+
+NO_CHANGE_HEARTBEAT_HOURS = 4.0
 
 
 # ─── log helper ──────────────────────────────────────────────────────────────
@@ -50,7 +56,7 @@ def banner(label: str) -> None:
     print(f"\n{'─' * 60}\n  {label}\n{'─' * 60}")
 
 
-# ─── Preflight: confirm env + tooling are wired (no secret values printed) ───
+# ─── Preflight ───────────────────────────────────────────────────────────────
 def preflight() -> None:
     banner("PREFLIGHT")
     print(f"python          = {platform.python_version()}")
@@ -72,20 +78,19 @@ def preflight() -> None:
     print(f"RESEND_API_KEY  = {'set' if RESEND_KEY                        else 'NOT SET'}")
     print(f"NOTIFY_TO       = {'set' if NOTIFY_TO                         else 'NOT SET'}")
     print(f"NOTIFY_FROM     = {NOTIFY_FROM}")
+    print(f"FORCE_EMAIL     = {FORCE_EMAIL}")
+    print(f"heartbeat       = {NO_CHANGE_HEARTBEAT_HOURS}h")
 
 
 # ─── Fetch ───────────────────────────────────────────────────────────────────
 def fetch_leaderboard() -> list[dict]:
-    """Use the kaggle CLI to download a CSV; return list of rows in rank order."""
     banner("FETCH LEADERBOARD")
-
     TMP_DIR.mkdir(exist_ok=True)
     for f in TMP_DIR.glob("*"):
         f.unlink()
 
     cmd = ["kaggle", "competitions", "leaderboard", COMP, "-d", "-p", str(TMP_DIR)]
     print(f"$ {' '.join(cmd)}")
-
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.stdout:
         print(f"[kaggle stdout]\n{proc.stdout.rstrip()}")
@@ -95,11 +100,8 @@ def fetch_leaderboard() -> list[dict]:
     if proc.returncode != 0:
         raise RuntimeError(
             f"kaggle CLI failed with exit {proc.returncode}. Common causes:\n"
-            f"  401 -> KAGGLE_USERNAME / KAGGLE_KEY secrets are wrong, swapped,\n"
-            f"         or contain quotes/whitespace. Use a LEGACY API key, not a\n"
-            f"         new-style API token.\n"
-            f"  403 -> the account that owns the token has not joined / accepted\n"
-            f"         rules for '{COMP}'.\n"
+            f"  401 -> KAGGLE_USERNAME / KAGGLE_KEY wrong, swapped, or quoted.\n"
+            f"  403 -> account hasn't joined / accepted rules for '{COMP}'.\n"
             f"  404 -> COMP slug is wrong.\n"
         )
 
@@ -137,7 +139,7 @@ def find_me(board: list[dict]) -> tuple[int, dict] | None:
     return None
 
 
-# ─── Email (never raises; failure is logged + returned as False) ─────────────
+# ─── Email ───────────────────────────────────────────────────────────────────
 def send_email(subject: str, body: str) -> bool:
     if not (RESEND_KEY and NOTIFY_TO):
         print("[email] skipped (RESEND_API_KEY or NOTIFY_TO missing)")
@@ -169,14 +171,15 @@ def send_email(subject: str, body: str) -> bool:
             print("[email]       address unless you verify a domain.")
         elif r.status_code == 422:
             print("[email] hint: NOTIFY_FROM format probably invalid.")
+        elif r.status_code == 429:
+            print("[email] hint: Resend rate limit (100/day on free tier).")
         return False
     return True
 
 
-# ─── Diff: compute every meaningful change between two boards ────────────────
+# ─── Diff ────────────────────────────────────────────────────────────────────
 def compute_diff(prev_board: list[dict] | None,
                  curr_board: list[dict]) -> dict | None:
-    """Return categorized changes, or None on cold start (no prev)."""
     if not prev_board:
         return None
 
@@ -186,9 +189,8 @@ def compute_diff(prev_board: list[dict] | None,
     new_teams       : list[dict] = []
     removed_teams   : list[dict] = []
     score_changes   : list[dict] = []
-    new_submissions : list[dict] = []  # resubmitted but score unchanged
+    new_submissions : list[dict] = []
 
-    # walk current board: detect new arrivals + score/submission changes
     for tid, (curr_rank, curr_row) in curr_by_id.items():
         if tid not in prev_by_id:
             new_teams.append({
@@ -222,7 +224,6 @@ def compute_diff(prev_board: list[dict] | None,
                 "submitted": curr_submitted,
             })
 
-    # walk previous board: detect departures
     for tid, (prev_rank, prev_row) in prev_by_id.items():
         if tid not in curr_by_id:
             removed_teams.append({
@@ -241,80 +242,17 @@ def compute_diff(prev_board: list[dict] | None,
     }
 
 
-# ─── Email body builder ──────────────────────────────────────────────────────
+# ─── Email body ──────────────────────────────────────────────────────────────
 def short_dt(s: str) -> str:
-    """Trim ISO timestamp for compact display: '2026-05-01T20:25:14Z' -> '05-01 20:25'."""
     if not s:
         return ""
     s = s.replace("T", " ").replace("Z", "")
     return s[5:16] if len(s) >= 16 else s
 
 
-def build_email(iso: str,
-                diff: dict,
-                board: list[dict],
-                me: tuple[int, dict] | None) -> tuple[str, str]:
-    """Return (subject, body)."""
-    nc = len(diff["score_changes"])
-    nn = len(diff["new_teams"])
-    nr = len(diff["removed_teams"])
-    ns = len(diff["new_submissions"])
-
-    summary_bits = []
-    if nc: summary_bits.append(f"{nc} score change{'s' if nc != 1 else ''}")
-    if nn: summary_bits.append(f"{nn} new team{'s' if nn != 1 else ''}")
-    if nr: summary_bits.append(f"{nr} removed")
-    if ns: summary_bits.append(f"{ns} resubmission{'s' if ns != 1 else ''}")
-    summary = ", ".join(summary_bits) or "leaderboard updated"
-
-    me_tag = f"  (you: #{me[0]}, score={me[1]['score']})" if me else ""
-    subject = f"HELIX :: {summary}{me_tag}"
-
+def render_full_board(board: list[dict],
+                      me: tuple[int, dict] | None) -> list[str]:
     L: list[str] = []
-    L.append(f"Time:        {iso}")
-    L.append(f"Competition: {COMP}")
-    L.append("")
-    L.append("=" * 60)
-    L.append("  CHANGES SINCE LAST POLL")
-    L.append("=" * 60)
-
-    if diff["score_changes"]:
-        L.append("")
-        L.append(f"Score changes ({nc}):")
-        for c in diff["score_changes"]:
-            name = (c["team_name"] or "")[:32]
-            rank_arrow = (f"#{c['prev_rank']:>3} -> #{c['curr_rank']:<3}"
-                          if c["prev_rank"] != c["curr_rank"]
-                          else f"#{c['curr_rank']:<3} (no rank change)")
-            L.append(f"  {name:32}  {rank_arrow}  "
-                     f"{c['prev_score']} -> {c['curr_score']}  "
-                     f"[{short_dt(c['submitted'])}]")
-
-    if diff["new_teams"]:
-        L.append("")
-        L.append(f"New teams ({nn}):")
-        for t in diff["new_teams"]:
-            name = (t["team_name"] or "")[:32]
-            L.append(f"  {name:32}  #{t['rank']:<3}                 "
-                     f"score={t['score']}  [{short_dt(t['submitted'])}]")
-
-    if diff["removed_teams"]:
-        L.append("")
-        L.append(f"Removed teams ({nr}):")
-        for t in diff["removed_teams"]:
-            name = (t["team_name"] or "")[:32]
-            L.append(f"  {name:32}  was #{t['prev_rank']:<3}             "
-                     f"score={t['score']}")
-
-    if diff["new_submissions"]:
-        L.append("")
-        L.append(f"Resubmissions, no score improvement ({ns}):")
-        for t in diff["new_submissions"]:
-            name = (t["team_name"] or "")[:32]
-            L.append(f"  {name:32}  #{t['rank']:<3}                 "
-                     f"score={t['score']}  [{short_dt(t['submitted'])}]")
-
-    L.append("")
     L.append("=" * 60)
     L.append(f"  COMPLETE LEADERBOARD ({len(board)} teams)")
     L.append("=" * 60)
@@ -324,10 +262,118 @@ def build_email(iso: str,
         marker = "  <-- YOU" if (me and i == me[0]) else ""
         L.append(f"  #{i:>3}  {name:32}  {r['score']:>10}  "
                  f"[{short_dt(r['submitted'])}]{marker}")
+    return L
 
+
+def build_email(iso: str,
+                diff: dict | None,
+                board: list[dict],
+                me: tuple[int, dict] | None,
+                trigger: str) -> tuple[str, str]:
+    """trigger ∈ {'cold-start', 'changes', 'heartbeat', 'forced'}"""
+
+    me_tag = f"  (you: #{me[0]}, score={me[1]['score']})" if me else ""
+    change_lines: list[str] = []
+
+    if trigger == "cold-start":
+        summary = "baseline established"
+        change_lines.append("First run / no previous state to compare against.")
+        change_lines.append("Baseline below.")
+
+    elif trigger == "heartbeat":
+        summary = f"no change ({NO_CHANGE_HEARTBEAT_HOURS:.0f}h heartbeat)"
+        change_lines.append("No changes since last poll. "
+                            f"Routine {NO_CHANGE_HEARTBEAT_HOURS:.0f}h heartbeat fire.")
+
+    elif trigger == "forced":
+        summary = "no change (manual test)"
+        change_lines.append("No changes since last poll. Manual test fire (FORCE_EMAIL=true).")
+
+    else:  # 'changes'
+        nc = len(diff["score_changes"])
+        nn = len(diff["new_teams"])
+        nr = len(diff["removed_teams"])
+        ns = len(diff["new_submissions"])
+        bits = []
+        if nc: bits.append(f"{nc} score change{'s' if nc != 1 else ''}")
+        if nn: bits.append(f"{nn} new team{'s' if nn != 1 else ''}")
+        if nr: bits.append(f"{nr} removed")
+        if ns: bits.append(f"{ns} resubmission{'s' if ns != 1 else ''}")
+        summary = ", ".join(bits)
+
+        if diff["score_changes"]:
+            change_lines.append("")
+            change_lines.append(f"Score changes ({nc}):")
+            for c in diff["score_changes"]:
+                name = (c["team_name"] or "")[:32]
+                rank_arrow = (f"#{c['prev_rank']:>3} -> #{c['curr_rank']:<3}"
+                              if c["prev_rank"] != c["curr_rank"]
+                              else f"#{c['curr_rank']:<3} (no rank change)")
+                change_lines.append(
+                    f"  {name:32}  {rank_arrow}  "
+                    f"{c['prev_score']} -> {c['curr_score']}  "
+                    f"[{short_dt(c['submitted'])}]"
+                )
+
+        if diff["new_teams"]:
+            change_lines.append("")
+            change_lines.append(f"New teams ({nn}):")
+            for t in diff["new_teams"]:
+                name = (t["team_name"] or "")[:32]
+                change_lines.append(
+                    f"  {name:32}  #{t['rank']:<3}                 "
+                    f"score={t['score']}  [{short_dt(t['submitted'])}]"
+                )
+
+        if diff["removed_teams"]:
+            change_lines.append("")
+            change_lines.append(f"Removed teams ({nr}):")
+            for t in diff["removed_teams"]:
+                name = (t["team_name"] or "")[:32]
+                change_lines.append(
+                    f"  {name:32}  was #{t['prev_rank']:<3}             "
+                    f"score={t['score']}"
+                )
+
+        if diff["new_submissions"]:
+            change_lines.append("")
+            change_lines.append(f"Resubmissions, no score improvement ({ns}):")
+            for t in diff["new_submissions"]:
+                name = (t["team_name"] or "")[:32]
+                change_lines.append(
+                    f"  {name:32}  #{t['rank']:<3}                 "
+                    f"score={t['score']}  [{short_dt(t['submitted'])}]"
+                )
+
+    subject = f"HELIX :: {summary}{me_tag}"
+
+    L: list[str] = []
+    L.append(f"Time:        {iso}")
+    L.append(f"Competition: {COMP}")
+    L.append(f"Trigger:     {trigger}")
+    L.append("")
+    L.append("=" * 60)
+    L.append("  CHANGES SINCE LAST POLL")
+    L.append("=" * 60)
+    L.extend(change_lines)
+    L.append("")
+    L.extend(render_full_board(board, me))
     L.append("")
     L.append(f"https://www.kaggle.com/competitions/{COMP}/leaderboard")
     return subject, "\n".join(L)
+
+
+# ─── time helpers ────────────────────────────────────────────────────────────
+def hours_since(iso_str: str) -> float:
+    if not iso_str:
+        return 9999.0
+    try:
+        then = datetime.fromisoformat(iso_str)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
+    except Exception:
+        return 9999.0
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -343,7 +389,7 @@ def main() -> None:
 
     board = fetch_leaderboard()
 
-    banner("DIFF")
+    banner("DIFF + DECISION")
     me = find_me(board)
     if me is None:
         print(f"WARNING: team fragment '{MY_TEAM}' not found on board")
@@ -358,21 +404,49 @@ def main() -> None:
         except Exception as e:
             print(f"[state] could not parse previous state: {e}")
 
-    prev_board = prev.get("full_board")
+    prev_board       = prev.get("full_board")
+    last_email_iso   = prev.get("last_email_at", "")
+    hrs_since_email  = hours_since(last_email_iso)
+
     diff = compute_diff(prev_board, board)
 
+    # decide trigger
     if diff is None:
-        print("cold start (no previous state) -- baseline only, no email")
+        state_label = "COLD START"
+        trigger     = "cold-start"
+        should_send = True
+        reason      = "first run, no prev state"
+    elif diff["any_change"]:
+        state_label = "CHANGES DETECTED"
+        trigger     = "changes"
+        should_send = True
+        reason      = (f"score:{len(diff['score_changes'])} "
+                       f"new:{len(diff['new_teams'])} "
+                       f"removed:{len(diff['removed_teams'])} "
+                       f"resub:{len(diff['new_submissions'])}")
+    elif FORCE_EMAIL:
+        state_label = "NO CHANGE (forced)"
+        trigger     = "forced"
+        should_send = True
+        reason      = "FORCE_EMAIL=true"
+    elif hrs_since_email >= NO_CHANGE_HEARTBEAT_HOURS:
+        state_label = "NO CHANGE (heartbeat)"
+        trigger     = "heartbeat"
+        should_send = True
+        reason      = (f"{hrs_since_email:.1f}h since last email "
+                       f">= {NO_CHANGE_HEARTBEAT_HOURS}h threshold")
     else:
-        n_changes = (len(diff["score_changes"]) + len(diff["new_teams"])
-                     + len(diff["removed_teams"]) + len(diff["new_submissions"]))
-        print(f"score_changes   = {len(diff['score_changes'])}")
-        print(f"new_teams       = {len(diff['new_teams'])}")
-        print(f"removed_teams   = {len(diff['removed_teams'])}")
-        print(f"new_submissions = {len(diff['new_submissions'])}")
-        print(f"total changes   = {n_changes}")
+        state_label = "NO CHANGE (silent)"
+        trigger     = "silent"
+        should_send = False
+        reason      = (f"{hrs_since_email:.1f}h since last email "
+                       f"< {NO_CHANGE_HEARTBEAT_HOURS}h threshold")
 
-    # per-poll snapshot for git history (full board for full reconstructability)
+    print(f"state           = {state_label}")
+    print(f"reason          = {reason}")
+    print(f"send email      = {should_send}")
+
+    # per-poll snapshot (always)
     snap = SNAP_DIR / f"{iso.replace(':','-')}.json"
     snap.write_text(json.dumps({
         "at":         iso,
@@ -382,28 +456,31 @@ def main() -> None:
         "full_board": board,
     }, indent=2))
 
-    # alert decision
+    # email if triggered
     alerted = False
-    if diff and diff["any_change"]:
+    if should_send:
         banner("ALERT")
-        subject, body = build_email(iso, diff, board, me)
+        subject, body = build_email(iso, diff, board, me, trigger)
         print(f"subject: {subject}")
         alerted = send_email(subject, body)
-    elif diff is not None:
-        print("no changes since last poll")
 
-    # persist new state regardless of email outcome
+    # update last_email_at on successful send (preserves throttle correctness)
+    new_last_email = iso if alerted else last_email_iso
+
+    # persist state
     STATE.write_text(json.dumps({
-        "at":         iso,
-        "my_rank":    curr_rank,
-        "my_score":   curr_score,
-        "team_count": len(board),
-        "alerted":    alerted,
-        "full_board": board,
+        "at":             iso,
+        "my_rank":        curr_rank,
+        "my_score":       curr_score,
+        "team_count":     len(board),
+        "alerted":        alerted,
+        "last_email_at":  new_last_email,
+        "last_trigger":   trigger,
+        "full_board":     board,
     }, indent=2))
 
     banner("DONE")
-    print(f"rank={curr_rank}  score={curr_score}  alerted={alerted}")
+    print(f"rank={curr_rank}  score={curr_score}  trigger={trigger}  alerted={alerted}")
 
 
 if __name__ == "__main__":

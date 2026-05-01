@@ -3,7 +3,13 @@ name: HELIX Kaggle Leaderboard Monitor
 on:
   schedule:
     - cron: '*/15 * * * *'   # every 15 minutes
-  workflow_dispatch:         # manual trigger button
+  workflow_dispatch:
+    inputs:
+      force_email:
+        description: 'Force an email even if there is no change (test fire)'
+        required: false
+        default: false
+        type: boolean
 
 # allow the workflow to push commits back
 permissions:
@@ -39,6 +45,7 @@ jobs:
           RESEND_API_KEY:  ${{ secrets.RESEND_API_KEY }}
           NOTIFY_TO:       ${{ secrets.NOTIFY_TO }}
           NOTIFY_FROM:     ${{ vars.NOTIFY_FROM }}
+          FORCE_EMAIL:     ${{ github.event.inputs.force_email }}
         run: python monitor.py
 
       - name: Commit snapshot
