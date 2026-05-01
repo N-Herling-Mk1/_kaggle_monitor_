@@ -3,14 +3,14 @@
 HELIX :: Kaggle leaderboard polling worker for GitHub Actions.
 
   - Pulls the leaderboard via the official kaggle CLI.
-  - Compares your rank/score against the last committed state.json.
-  - On rank drop (someone passed you) -> emails via Resend.
+  - Diffs current board vs last committed state.json.
+  - On ANY change (score, new team, removed team, resubmission) -> emails via Resend.
   - Writes a fresh state.json + per-poll snapshot for the git commit.
 
 Required env (set as repo Secrets / Variables in GitHub):
   COMP             (variable)  competition slug, e.g. ling-539-competition-2026
-  KAGGLE_USERNAME  (secret)    from kaggle.json
-  KAGGLE_KEY       (secret)    from kaggle.json
+  KAGGLE_USERNAME  (secret)    legacy username from kaggle.json
+  KAGGLE_KEY       (secret)    legacy key from kaggle.json
   MY_TEAM          (secret)    your team-name fragment used to find you
   RESEND_API_KEY   (secret)    re_xxx... from resend.com (free tier 100/day)
   NOTIFY_TO        (secret)    where to send the alert
@@ -76,7 +76,7 @@ def preflight() -> None:
 
 # ─── Fetch ───────────────────────────────────────────────────────────────────
 def fetch_leaderboard() -> list[dict]:
-    """Use the kaggle CLI to download a CSV; return list of rows."""
+    """Use the kaggle CLI to download a CSV; return list of rows in rank order."""
     banner("FETCH LEADERBOARD")
 
     TMP_DIR.mkdir(exist_ok=True)
@@ -86,7 +86,6 @@ def fetch_leaderboard() -> list[dict]:
     cmd = ["kaggle", "competitions", "leaderboard", COMP, "-d", "-p", str(TMP_DIR)]
     print(f"$ {' '.join(cmd)}")
 
-    # Capture but ALSO surface stdout/stderr so we can see what kaggle says.
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.stdout:
         print(f"[kaggle stdout]\n{proc.stdout.rstrip()}")
@@ -96,10 +95,11 @@ def fetch_leaderboard() -> list[dict]:
     if proc.returncode != 0:
         raise RuntimeError(
             f"kaggle CLI failed with exit {proc.returncode}. Common causes:\n"
-            f"  401 -> KAGGLE_USERNAME / KAGGLE_KEY secrets are wrong or swapped.\n"
+            f"  401 -> KAGGLE_USERNAME / KAGGLE_KEY secrets are wrong, swapped,\n"
+            f"         or contain quotes/whitespace. Use a LEGACY API key, not a\n"
+            f"         new-style API token.\n"
             f"  403 -> the account that owns the token has not joined / accepted\n"
-            f"         rules for '{COMP}'. Open the competition page while\n"
-            f"         logged in as that account and click Join / Accept.\n"
+            f"         rules for '{COMP}'.\n"
             f"  404 -> COMP slug is wrong.\n"
         )
 
@@ -121,7 +121,7 @@ def fetch_leaderboard() -> list[dict]:
                 "team_id":   r.get("TeamId"),
                 "team_name": r.get("TeamName") or r.get("Team") or "",
                 "score":     r.get("Score") or "",
-                "submitted": r.get("SubmissionDate") or r.get("LastSubmissionDate"),
+                "submitted": r.get("SubmissionDate") or r.get("LastSubmissionDate") or "",
             })
     print(f"parsed rows     = {len(rows)}")
     return rows
@@ -173,17 +173,161 @@ def send_email(subject: str, body: str) -> bool:
     return True
 
 
-# ─── Diff logic: who passed me (keyed on team_id, not name) ──────────────────
-def passers(prev_board: list[dict] | None,
-            curr_board: list[dict],
-            prev_rank: int | None,
-            curr_rank: int) -> list[dict]:
-    """Rows currently ranked above me that were NOT above me last time."""
-    if not prev_board or prev_rank is None:
-        return []
-    prev_above_ids = {r.get("team_id") for r in prev_board[:prev_rank - 1]}
-    curr_above     = curr_board[:curr_rank - 1]
-    return [r for r in curr_above if r.get("team_id") not in prev_above_ids]
+# ─── Diff: compute every meaningful change between two boards ────────────────
+def compute_diff(prev_board: list[dict] | None,
+                 curr_board: list[dict]) -> dict | None:
+    """Return categorized changes, or None on cold start (no prev)."""
+    if not prev_board:
+        return None
+
+    prev_by_id = {r["team_id"]: (i + 1, r) for i, r in enumerate(prev_board)}
+    curr_by_id = {r["team_id"]: (i + 1, r) for i, r in enumerate(curr_board)}
+
+    new_teams       : list[dict] = []
+    removed_teams   : list[dict] = []
+    score_changes   : list[dict] = []
+    new_submissions : list[dict] = []  # resubmitted but score unchanged
+
+    # walk current board: detect new arrivals + score/submission changes
+    for tid, (curr_rank, curr_row) in curr_by_id.items():
+        if tid not in prev_by_id:
+            new_teams.append({
+                "rank":      curr_rank,
+                "team_name": curr_row["team_name"],
+                "score":     curr_row["score"],
+                "submitted": curr_row["submitted"],
+            })
+            continue
+
+        prev_rank, prev_row = prev_by_id[tid]
+        prev_score     = prev_row.get("score", "") or ""
+        curr_score     = curr_row.get("score", "") or ""
+        prev_submitted = prev_row.get("submitted", "") or ""
+        curr_submitted = curr_row.get("submitted", "") or ""
+
+        if prev_score != curr_score:
+            score_changes.append({
+                "team_name":  curr_row["team_name"],
+                "prev_rank":  prev_rank,
+                "curr_rank":  curr_rank,
+                "prev_score": prev_score,
+                "curr_score": curr_score,
+                "submitted":  curr_submitted,
+            })
+        elif curr_submitted and prev_submitted != curr_submitted:
+            new_submissions.append({
+                "team_name": curr_row["team_name"],
+                "rank":      curr_rank,
+                "score":     curr_score,
+                "submitted": curr_submitted,
+            })
+
+    # walk previous board: detect departures
+    for tid, (prev_rank, prev_row) in prev_by_id.items():
+        if tid not in curr_by_id:
+            removed_teams.append({
+                "prev_rank": prev_rank,
+                "team_name": prev_row["team_name"],
+                "score":     prev_row.get("score", ""),
+            })
+
+    any_change = bool(new_teams or removed_teams or score_changes or new_submissions)
+    return {
+        "new_teams":       new_teams,
+        "removed_teams":   removed_teams,
+        "score_changes":   score_changes,
+        "new_submissions": new_submissions,
+        "any_change":      any_change,
+    }
+
+
+# ─── Email body builder ──────────────────────────────────────────────────────
+def short_dt(s: str) -> str:
+    """Trim ISO timestamp for compact display: '2026-05-01T20:25:14Z' -> '05-01 20:25'."""
+    if not s:
+        return ""
+    s = s.replace("T", " ").replace("Z", "")
+    return s[5:16] if len(s) >= 16 else s
+
+
+def build_email(iso: str,
+                diff: dict,
+                board: list[dict],
+                me: tuple[int, dict] | None) -> tuple[str, str]:
+    """Return (subject, body)."""
+    nc = len(diff["score_changes"])
+    nn = len(diff["new_teams"])
+    nr = len(diff["removed_teams"])
+    ns = len(diff["new_submissions"])
+
+    summary_bits = []
+    if nc: summary_bits.append(f"{nc} score change{'s' if nc != 1 else ''}")
+    if nn: summary_bits.append(f"{nn} new team{'s' if nn != 1 else ''}")
+    if nr: summary_bits.append(f"{nr} removed")
+    if ns: summary_bits.append(f"{ns} resubmission{'s' if ns != 1 else ''}")
+    summary = ", ".join(summary_bits) or "leaderboard updated"
+
+    me_tag = f"  (you: #{me[0]}, score={me[1]['score']})" if me else ""
+    subject = f"HELIX :: {summary}{me_tag}"
+
+    L: list[str] = []
+    L.append(f"Time:        {iso}")
+    L.append(f"Competition: {COMP}")
+    L.append("")
+    L.append("=" * 60)
+    L.append("  CHANGES SINCE LAST POLL")
+    L.append("=" * 60)
+
+    if diff["score_changes"]:
+        L.append("")
+        L.append(f"Score changes ({nc}):")
+        for c in diff["score_changes"]:
+            name = (c["team_name"] or "")[:32]
+            rank_arrow = (f"#{c['prev_rank']:>3} -> #{c['curr_rank']:<3}"
+                          if c["prev_rank"] != c["curr_rank"]
+                          else f"#{c['curr_rank']:<3} (no rank change)")
+            L.append(f"  {name:32}  {rank_arrow}  "
+                     f"{c['prev_score']} -> {c['curr_score']}  "
+                     f"[{short_dt(c['submitted'])}]")
+
+    if diff["new_teams"]:
+        L.append("")
+        L.append(f"New teams ({nn}):")
+        for t in diff["new_teams"]:
+            name = (t["team_name"] or "")[:32]
+            L.append(f"  {name:32}  #{t['rank']:<3}                 "
+                     f"score={t['score']}  [{short_dt(t['submitted'])}]")
+
+    if diff["removed_teams"]:
+        L.append("")
+        L.append(f"Removed teams ({nr}):")
+        for t in diff["removed_teams"]:
+            name = (t["team_name"] or "")[:32]
+            L.append(f"  {name:32}  was #{t['prev_rank']:<3}             "
+                     f"score={t['score']}")
+
+    if diff["new_submissions"]:
+        L.append("")
+        L.append(f"Resubmissions, no score improvement ({ns}):")
+        for t in diff["new_submissions"]:
+            name = (t["team_name"] or "")[:32]
+            L.append(f"  {name:32}  #{t['rank']:<3}                 "
+                     f"score={t['score']}  [{short_dt(t['submitted'])}]")
+
+    L.append("")
+    L.append("=" * 60)
+    L.append(f"  COMPLETE LEADERBOARD ({len(board)} teams)")
+    L.append("=" * 60)
+    L.append("")
+    for i, r in enumerate(board, 1):
+        name = (r["team_name"] or "")[:32]
+        marker = "  <-- YOU" if (me and i == me[0]) else ""
+        L.append(f"  #{i:>3}  {name:32}  {r['score']:>10}  "
+                 f"[{short_dt(r['submitted'])}]{marker}")
+
+    L.append("")
+    L.append(f"https://www.kaggle.com/competitions/{COMP}/leaderboard")
+    return subject, "\n".join(L)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -199,7 +343,7 @@ def main() -> None:
 
     board = fetch_leaderboard()
 
-    banner("RANK DIFF")
+    banner("DIFF")
     me = find_me(board)
     if me is None:
         print(f"WARNING: team fragment '{MY_TEAM}' not found on board")
@@ -214,56 +358,39 @@ def main() -> None:
         except Exception as e:
             print(f"[state] could not parse previous state: {e}")
 
-    prev_rank  = prev.get("my_rank")
-    prev_score = prev.get("my_score")
     prev_board = prev.get("full_board")
+    diff = compute_diff(prev_board, board)
 
-    print(f"prev rank/score : {prev_rank} / {prev_score}")
-    print(f"curr rank/score : {curr_rank} / {curr_score}")
+    if diff is None:
+        print("cold start (no previous state) -- baseline only, no email")
+    else:
+        n_changes = (len(diff["score_changes"]) + len(diff["new_teams"])
+                     + len(diff["removed_teams"]) + len(diff["new_submissions"]))
+        print(f"score_changes   = {len(diff['score_changes'])}")
+        print(f"new_teams       = {len(diff['new_teams'])}")
+        print(f"removed_teams   = {len(diff['removed_teams'])}")
+        print(f"new_submissions = {len(diff['new_submissions'])}")
+        print(f"total changes   = {n_changes}")
 
-    # per-poll snapshot for git history
+    # per-poll snapshot for git history (full board for full reconstructability)
     snap = SNAP_DIR / f"{iso.replace(':','-')}.json"
     snap.write_text(json.dumps({
         "at":         iso,
         "team_count": len(board),
         "my_rank":    curr_rank,
         "my_score":   curr_score,
-        "top_25":     board[:25],
+        "full_board": board,
     }, indent=2))
 
     # alert decision
     alerted = False
-    if curr_rank and prev_rank and curr_rank > prev_rank:
+    if diff and diff["any_change"]:
         banner("ALERT")
-        new_above = passers(prev_board, board, prev_rank, curr_rank)
-        delta     = curr_rank - prev_rank
-        subject   = f"HELIX :: rank drop  #{prev_rank} -> #{curr_rank}  (-{delta})"
-        lines = [
-            f"Time:        {iso}",
-            f"Competition: {COMP}",
-            f"",
-            f"Your rank dropped from #{prev_rank} to #{curr_rank}  ({-delta:+d}).",
-            f"Your score:  {curr_score}   (prev: {prev_score})",
-            f"",
-        ]
-        if new_above:
-            lines.append(f"Teams that passed you ({len(new_above)}):")
-            for r in new_above:
-                name = (r["team_name"] or "")[:30]
-                lines.append(f"   - {name:30}  score={r['score']}")
-            lines.append("")
-        lines += [
-            f"Top of board now:",
-            *[f"  #{i+1:3}  {(r['team_name'] or '')[:30]:30}  {r['score']}"
-              for i, r in enumerate(board[:10])],
-            "",
-            f"https://www.kaggle.com/competitions/{COMP}/leaderboard",
-        ]
-        alerted = send_email(subject, "\n".join(lines))
-    elif curr_rank and prev_rank and curr_rank < prev_rank:
-        print(f"climbed: #{prev_rank} -> #{curr_rank}  (no email; only on drops)")
-    else:
-        print("no rank change")
+        subject, body = build_email(iso, diff, board, me)
+        print(f"subject: {subject}")
+        alerted = send_email(subject, body)
+    elif diff is not None:
+        print("no changes since last poll")
 
     # persist new state regardless of email outcome
     STATE.write_text(json.dumps({
