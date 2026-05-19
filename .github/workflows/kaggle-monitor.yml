@@ -1,8 +1,11 @@
 name: HELIX Kaggle Leaderboard Monitor
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'   # every 15 minutes
+  # --- EMAIL UPDATES DISABLED 2026-05-19 ---
+  # To re-enable: uncomment the two lines below ("schedule:" and the "- cron:" line).
+  # See README section "DISABLING / RE-ENABLING EMAIL UPDATES" for details.
+  # schedule:
+  #   - cron: '*/15 * * * *'   # every 15 minutes
   workflow_dispatch:
     inputs:
       force_email:

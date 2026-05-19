@@ -11,6 +11,45 @@ snapshots/<UTC timestamp>.json         <- one per poll, audit trail
 ```
 
 ----------------------------------------------------------------
+CURRENT STATUS: EMAIL UPDATES DISABLED  (as of 2026-05-19)
+----------------------------------------------------------------
+
+The cron schedule in `.github/workflows/kaggle-monitor.yml` has been
+commented out, so the workflow no longer polls every 15 minutes and
+no emails will be sent. Nothing else has been deleted or changed:
+monitor.py, state.json, snapshots/, secrets, and variables are all
+intact for future reference.
+
+The workflow can still be run manually from the Actions tab
+("Run workflow") because `workflow_dispatch` is left enabled.
+
+To RE-ENABLE the 15-minute polling + email updates:
+
+  1. Open .github/workflows/kaggle-monitor.yml
+  2. Find the block under `on:` that looks like:
+
+         # --- EMAIL UPDATES DISABLED 2026-05-19 ---
+         # To re-enable: uncomment the two lines below ...
+         # schedule:
+         #   - cron: '*/15 * * * *'   # every 15 minutes
+         workflow_dispatch:
+
+  3. Uncomment the `schedule:` line and the `- cron:` line so it reads:
+
+         schedule:
+           - cron: '*/15 * * * *'   # every 15 minutes
+         workflow_dispatch:
+
+     (Indentation matters in YAML. `schedule:` lines up with
+     `workflow_dispatch:`; the `- cron:` line is indented two more spaces.)
+
+  4. Commit and push. The cron will resume on its next tick.
+
+Note: GitHub silently disables scheduled workflows on repos with no
+activity for 60 days. After a long pause, pushing the re-enable commit
+above is itself the wake-up event, so no extra step is needed.
+
+----------------------------------------------------------------
 SETUP  (one-time, ~5 minutes)
 ----------------------------------------------------------------
 
